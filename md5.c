@@ -1,27 +1,29 @@
 #include "md5.h"
-#include <limits.h>
 #include <math.h>
-#include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 
-int r[64] = {7,  12, 17, 22, 7,  12, 17, 22, 7,  12, 17, 22, 7,  12, 17, 22,
-             5,  9,  14, 20, 5,  9,  14, 20, 5,  9,  14, 20, 5,  9,  14, 20,
-             4,  11, 16, 23, 4,  11, 16, 23, 4,  11, 16, 23, 4,  11, 16, 6,
-             10, 15, 21, 6,  10, 15, 21, 6,  10, 15, 21, 6,  10, 15, 21};
-uint32_t k[64];
-uint32_t h0, h1, h2, h3;
+int LR_OFFSET[64] = {
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+};
 
-void init();
-void md5(BYTE *message, BYTE end, BYTE digest[16]);
-void process_chunk(BYTE *start);
-void encode(BYTE *output);
-void decode(BYTE *input, CHUNK output);
-void consume(CHUNK ck);
-uint32_t left_rotate(uint32_t w, int shift);
+Byte PADDING[64] = {0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+uint32_t T_TABLE[64];
 
-void MD5Init(MD5_CTX *context) {
-  context->count = 0ULL;
+void init_T_TABLE() {
+  unsigned int i;
+  for (i = 0; i < 64; ++i)
+    T_TABLE[i] = (uint32_t)floor(fabs(sin(i + 1)) * pow(2.0, 32.0));
+}
+
+void md5_init(MD5_CTX *context) {
+  // count以比特为单位
+  context->count[0] = context->count[1] = 0;
 
   context->state[0] = 0x67452301;
   context->state[1] = 0xefcdab89;
@@ -29,70 +31,69 @@ void MD5Init(MD5_CTX *context) {
   context->state[3] = 0x10325476;
 }
 
-void init() {
-  int i;
-  for (i = 0; i < 64; ++i)
-    k[i] = (uint32_t)floor(fabs(sin(i + 1)) * pow(2.0, 32.0));
-}
+// input_len以【字节】为单位，为32位整数
+void md5_update(MD5_CTX *context, Byte *input, uint32_t input_len) {
+  // unconsumed表示上一次未能凑整512比特而留下来的未哈希的【字节】数
+  unsigned int i, unconsumed;
 
-void md5(BYTE *message, BYTE end, BYTE digest[16]) {
-  init();
+  unconsumed = (unsigned int)((context->count[0] >> 3) % 64);
 
-  unsigned long long cur = 0;
-  bool first = true;
+  if ((context->count[0] += input_len << 3) < input_len << 3) /* overflow */
+    context->count[1]++;
+  context->count[1] += ((uint32_t)input_len >> 29);
 
-  while (message[cur] != end) {
-    if (cur == 0) {
-      if (first) {
-        first = false;
-      } else {
-        message += ULLONG_MAX;
-        message += 1;
-      }
-    }
-    if (cur % 512 == 0) {
-      process_chunk(message + cur);
-    }
-    ++cur;
-  }
+  /* Transform as many times as possible.*/
+  if (unconsumed + input_len >= 64) {
+    // 把之前不足一个block的补足，特殊情况unconsumed=0
+    md5_memcpy(context->buffer + unconsumed, input, 64 - unconsumed);
+    md5_transform(context->state, context->buffer);
 
-  encode(digest);
-  // CHUNK padding[2];
-  // padding
-}
+    // i为区间左端点（包括）
+    // i + 64为区间右端点（未包括）
+    for (i = 64 - unconsumed; i + 64 <= input_len; i += 64)
+      // 无需先cp进buffer
+      md5_transform(context->state, input + i);
 
-void process_chunk(BYTE *start) {
-  CHUNK ck;
-  decode(start, ck);
-  consume(ck);
-}
-
-void encode(BYTE *output) {
-  uint32_t h[4] = {h0, h1, h2, h3};
-  int i;
-  for (i = 0; i < 4; ++i) {
-    output[i * 4] = (BYTE)(h[i] & 0xff);
-    output[i * 4 + 1] = (BYTE)((h[i] >> 8) & 0xff);
-    output[i * 4 + 2] = (BYTE)((h[i] >> 16) & 0xff);
-    output[i * 4 + 3] = (BYTE)((h[i] >> 24) & 0xff);
+    // 剩余不足一个block的cp进buf
+    md5_memcpy(context->buffer, input + i, input_len - i);
+  } else {
+    md5_memcpy(context->buffer + unconsumed, input, input_len);
   }
 }
 
-void decode(BYTE *input, CHUNK output) {
-  int i, j;
-  for (i = 0; i < 16; ++i) {
-    j = 4 * i;
-    output[i] = (((uint32_t)input[j])) | (((uint32_t)input[j + 1]) << 8) |
-                (((uint32_t)input[j + 2]) << 16) |
-                (((uint32_t)input[j + 3]) << 24);
-  }
+void md5_final(Byte digest[16], MD5_CTX *context) {
+  Byte total_len[8];
+  unsigned int unconsumed, padding_len;
+
+  /* Save number of bits */
+  encode(total_len, context->count, 8);
+
+  /* Pad out to 56 mod 64.
+*/
+  unconsumed = (unsigned int)((context->count[0] >> 3) & 0x3f);
+  padding_len = (unconsumed < 56) ? (56 - unconsumed) : (56 + 64 - unconsumed);
+  md5_update(context, PADDING, padding_len);
+
+  /* Append length (before padding) */
+  md5_update(context, total_len, 8);
+
+  /* Store state in digest */
+  encode(digest, context->state, 16);
+
+  md5_clear(context, sizeof(*context));
 }
 
-void consume(CHUNK ck) {
-  uint32_t a = h0;
-  uint32_t b = h1;
-  uint32_t c = h2;
-  uint32_t d = h3;
+void md5_transform(uint32_t state[4], Byte block[64]) {
+  Block bk;
+  decode(bk, block, 16);
+  consume(state, bk);
+}
+
+void consume(uint32_t state[4], Block bk) {
+  uint32_t a = state[0];
+  uint32_t b = state[1];
+  uint32_t c = state[2];
+  uint32_t d = state[3];
   uint32_t f, temp;
   int i, g;
 
@@ -119,14 +120,34 @@ void consume(CHUNK ck) {
     temp = d;
     d = c;
     c = b;
-    b = left_rotate((a + f + k[i] + ck[g]), r[i]) + b;
+    b = left_rotate((a + f + T_TABLE[i] + bk[g]), LR_OFFSET[i]) + b;
     a = temp;
   }
 
-  h0 = h0 + a;
-  h1 = h1 + b;
-  h2 = h2 + c;
-  h3 = h3 + d;
+  state[0] += a;
+  state[1] += b;
+  state[2] += c;
+  state[3] += d;
+}
+
+void encode(Byte *output, uint32_t *input, unsigned int output_len) {
+  unsigned int i, j;
+
+  for (i = 0, j = 0; j < output_len; ++i, j += 4) {
+    output[j] = (Byte)(input[i] & 0xff);
+    output[j + 1] = (Byte)((input[i] >> 8) & 0xff);
+    output[j + 2] = (Byte)((input[i] >> 16) & 0xff);
+    output[j + 3] = (Byte)((input[i] >> 24) & 0xff);
+  }
+}
+
+void decode(uint32_t *output, Byte *input, unsigned int output_len) {
+  unsigned int i, j;
+
+  for (i = 0, j = 0; j < output_len; i += 4, ++j)
+    output[j] = ((uint32_t)input[i]) | (((uint32_t)input[i + 1]) << 8) |
+                (((uint32_t)input[i + 2]) << 16) |
+                (((uint32_t)input[i + 3]) << 24);
 }
 
 uint32_t left_rotate(uint32_t w, int shift) {
@@ -134,16 +155,14 @@ uint32_t left_rotate(uint32_t w, int shift) {
   return (w << shift) | (w >> (32 - shift));
 }
 
-int main() {
-  BYTE message[65];
-  BYTE digest[16];
-  int i;
-  for (i = 0; i < 64; ++i)
-    message[i] = 4 * (i + 1);
-  message[64] = 0;
-  md5(message, 0, digest);
-  for (i = 0; i < 16; ++i)
-    printf("%02x", digest[i]);
-  printf("\n");
-  return 0;
+void md5_memcpy(Byte *output, Byte *input, unsigned int len) {
+  unsigned int i;
+  for (i = 0; i < len; i++)
+    output[i] = input[i];
+}
+
+void md5_clear(MD5_CTX *context, unsigned int len) {
+  unsigned int i;
+  for (i = 0; i < len; i++)
+    ((char *)context)[i] = (char)0;
 }
